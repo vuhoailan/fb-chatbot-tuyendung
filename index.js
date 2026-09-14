@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const larkBase = require('./larkBase');
-const geminiExtract = require('./geminiExtract');
+const geminiChat = require('./geminiChat');
 
 const app = express();
 app.use(express.json());
@@ -11,6 +11,7 @@ const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.FB_PAGE_ACCESS_TOKEN;
 const COMPANY_NAME = process.env.COMPANY_NAME || 'công ty';
 const MIN_AGE = 18;
+const MAX_HISTORY = 20;
 
 const REQUIRED_FIELDS = ['hoTen', 'namSinh', 'gioiTinh', 'chieuCao', 'canNang', 'sdt'];
 const FIELD_LABELS = {
@@ -22,15 +23,24 @@ const FIELD_LABELS = {
   sdt: 'Số điện thoại',
 };
 
+// In-memory session store — reset if the server restarts (fine for MVP on free hosting).
+// Map<psid, { step: 'collecting' | 'confirm' | 'done', data: object, history: array }>
 const sessions = new Map();
 
 function newSession() {
-  return { step: 'collecting', data: {} };
+  return { step: 'collecting', data: {}, history: [] };
 }
 
 function getSession(psid) {
   if (!sessions.has(psid)) sessions.set(psid, newSession());
   return sessions.get(psid);
+}
+
+function pushHistory(session, role, text) {
+  session.history.push({ role, parts: [{ text }] });
+  if (session.history.length > MAX_HISTORY) {
+    session.history.splice(0, session.history.length - MAX_HISTORY);
+  }
 }
 
 function sanitizeField(key, value) {
@@ -61,6 +71,8 @@ function sanitizeField(key, value) {
   }
 }
 
+// ---------- Facebook webhook ----------
+
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -81,6 +93,7 @@ app.post('/webhook', async (req, res) => {
     return res.sendStatus(404);
   }
 
+  // Ack immediately; Facebook requires a fast 200.
   res.status(200).send('EVENT_RECEIVED');
 
   for (const entry of body.entry || []) {
@@ -108,20 +121,21 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// ---------- Conversation logic ----------
+
 async function handlePayload(psid, payload) {
   switch (payload) {
     case 'GET_STARTED':
     case 'DANG_KY':
       sessions.set(psid, newSession());
-      await sendText(psid, chaoMung());
-      await askInfo(psid);
+      await greet(psid);
       break;
     case 'XAC_NHAN':
       await submitCandidate(psid);
       break;
     case 'NHAP_LAI':
       sessions.set(psid, newSession());
-      await askInfo(psid);
+      await greet(psid);
       break;
   }
 }
@@ -131,8 +145,7 @@ async function handleText(psid, text) {
 
   if (['dang ky', 'đăng ký', 'bắt đầu', 'bat dau', 'start'].includes(lower)) {
     sessions.set(psid, newSession());
-    await sendText(psid, chaoMung());
-    await askInfo(psid);
+    await greet(psid);
     return;
   }
 
@@ -143,22 +156,30 @@ async function handleText(psid, text) {
     return;
   }
 
-  let extracted;
+  pushHistory(session, 'user', text);
+
+  let result;
   try {
-    extracted = await geminiExtract.extractCandidateInfo(text);
+    result = await geminiChat.converse(session.history);
   } catch (err) {
-    console.error('Gemini extract failed:', err.response ? err.response.data : err.message);
-    await sendText(psid, 'Mình đang gặp chút trục trặc khi đọc thông tin, bạn thử gửi lại giúp mình nhé.');
+    console.error('Gemini converse failed:', err.response ? err.response.data : err.message);
+    await sendText(psid, 'Mình đang gặp chút trục trặc, bạn thử gửi lại giúp mình nhé.');
     return;
   }
 
+  if (result.text) {
+    pushHistory(session, 'model', result.text);
+  }
+
   let updatedAny = false;
-  for (const key of REQUIRED_FIELDS) {
-    if (extracted[key] !== undefined && extracted[key] !== null) {
-      const clean = sanitizeField(key, extracted[key]);
-      if (clean !== null) {
-        session.data[key] = clean;
-        updatedAny = true;
+  if (result.extracted) {
+    for (const key of REQUIRED_FIELDS) {
+      if (result.extracted[key] !== undefined && result.extracted[key] !== null) {
+        const clean = sanitizeField(key, result.extracted[key]);
+        if (clean !== null) {
+          session.data[key] = clean;
+          updatedAny = true;
+        }
       }
     }
   }
@@ -167,30 +188,31 @@ async function handleText(psid, text) {
 
   if (missing.length > 0) {
     session.step = 'collecting';
-    if (!updatedAny) {
+    if (result.text) {
+      await sendText(psid, result.text);
+    } else if (updatedAny) {
+      await sendText(psid, `Cảm ơn bạn! Mình còn cần thêm: ${missing.map((k) => FIELD_LABELS[k]).join(', ')}.`);
+    } else {
       await sendText(
         psid,
-        'Mình chưa nhận ra thông tin đăng ký nào trong tin nhắn đó. Bạn thử gửi lại giúp mình: họ tên, năm sinh, giới tính, chiều cao, cân nặng và số điện thoại nhé.'
+        'Bạn có thể gửi lại giúp mình: họ tên, năm sinh, giới tính, chiều cao, cân nặng và số điện thoại nhé.'
       );
-      return;
     }
-    await sendText(psid, `Cảm ơn bạn! Mình còn cần thêm: ${missing.map((k) => FIELD_LABELS[k]).join(', ')}.`);
     return;
   }
 
+  if (result.text) {
+    await sendText(psid, result.text);
+  }
   session.step = 'confirm';
   await sendConfirm(psid, session.data);
 }
 
-function chaoMung() {
-  return `Chào bạn 👋 Cảm ơn bạn đã quan tâm đăng ký làm Cộng tác viên bảo vệ tại ${COMPANY_NAME}. Mình sẽ hỏi bạn vài thông tin cơ bản nhé!`;
-}
-
-async function askInfo(psid) {
-  await sendText(
-    psid,
-    'Bạn giới thiệu giúp mình một số thông tin nhé: họ tên, năm sinh, giới tính, chiều cao (cm), cân nặng (kg) và số điện thoại. Cứ gõ tự nhiên thoải mái, mình sẽ tự hiểu 🙂'
-  );
+async function greet(psid) {
+  const session = getSession(psid);
+  const text = `Chào bạn 👋 Cảm ơn bạn đã quan tâm đăng ký làm Cộng tác viên bảo an tại ${COMPANY_NAME}. Bạn cứ hỏi mình thoải mái, hoặc giới thiệu luôn thông tin (họ tên, năm sinh, giới tính, chiều cao, cân nặng, số điện thoại) để đăng ký nhé!`;
+  pushHistory(session, 'model', text);
+  await sendText(psid, text);
 }
 
 async function sendConfirm(psid, data) {
@@ -246,6 +268,8 @@ async function submitCandidate(psid) {
     );
   }
 }
+
+// ---------- Facebook Send API helpers ----------
 
 async function sendText(psid, text) {
   await callSendAPI(psid, { text });
