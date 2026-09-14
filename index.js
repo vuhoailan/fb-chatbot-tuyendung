@@ -13,8 +13,8 @@ const COMPANY_NAME = process.env.COMPANY_NAME || 'công ty';
 const MIN_AGE = 18;
 const MAX_HISTORY = 20;
 
-const REQUIRED_FIELDS = ['hoTen', 'namSinh', 'gioiTinh', 'chieuCao', 'canNang', 'sdt'];
-const FIELD_LABELS = {
+const CTV_FIELDS = ['hoTen', 'namSinh', 'gioiTinh', 'chieuCao', 'canNang', 'sdt'];
+const CTV_LABELS = {
   hoTen: 'Họ và tên',
   namSinh: 'Năm sinh',
   gioiTinh: 'Giới tính (Nam/Nữ)',
@@ -23,12 +23,19 @@ const FIELD_LABELS = {
   sdt: 'Số điện thoại',
 };
 
+const OFFICE_FIELDS = ['hoTen', 'sdt', 'viTriQuanTam'];
+const OFFICE_LABELS = {
+  hoTen: 'Họ và tên',
+  sdt: 'Số điện thoại',
+  viTriQuanTam: 'Vị trí bạn quan tâm',
+};
+
 // In-memory session store — reset if the server restarts (fine for MVP on free hosting).
-// Map<psid, { step: 'collecting' | 'confirm' | 'done', data: object, history: array }>
+// Map<psid, { step, pendingType, ctv: {}, office: {}, history: [] }>
 const sessions = new Map();
 
 function newSession() {
-  return { step: 'collecting', data: {}, history: [] };
+  return { step: 'collecting', pendingType: null, ctv: {}, office: {}, history: [] };
 }
 
 function getSession(psid) {
@@ -43,7 +50,7 @@ function pushHistory(session, role, text) {
   }
 }
 
-function sanitizeField(key, value) {
+function sanitizeCtvField(key, value) {
   switch (key) {
     case 'hoTen':
       return typeof value === 'string' && value.trim().length >= 2 ? value.trim() : null;
@@ -66,6 +73,21 @@ function sanitizeField(key, value) {
       const digits = String(value).replace(/[^0-9]/g, '');
       return digits.length >= 9 && digits.length <= 11 ? digits : null;
     }
+    default:
+      return null;
+  }
+}
+
+function sanitizeOfficeField(key, value) {
+  switch (key) {
+    case 'hoTen':
+      return typeof value === 'string' && value.trim().length >= 2 ? value.trim() : null;
+    case 'sdt': {
+      const digits = String(value).replace(/[^0-9]/g, '');
+      return digits.length >= 9 && digits.length <= 11 ? digits : null;
+    }
+    case 'viTriQuanTam':
+      return typeof value === 'string' && value.trim().length >= 2 ? value.trim() : null;
     default:
       return null;
   }
@@ -131,7 +153,7 @@ async function handlePayload(psid, payload) {
       await greet(psid);
       break;
     case 'XAC_NHAN':
-      await submitCandidate(psid);
+      await submitPending(psid);
       break;
     case 'NHAP_LAI':
       sessions.set(psid, newSession());
@@ -172,50 +194,73 @@ async function handleText(psid, text) {
   }
 
   let updatedAny = false;
-  if (result.extracted) {
-    for (const key of REQUIRED_FIELDS) {
+
+  if (result.functionName === 'extract_candidate_info' && result.extracted) {
+    for (const key of CTV_FIELDS) {
       if (result.extracted[key] !== undefined && result.extracted[key] !== null) {
-        const clean = sanitizeField(key, result.extracted[key]);
+        const clean = sanitizeCtvField(key, result.extracted[key]);
         if (clean !== null) {
-          session.data[key] = clean;
+          session.ctv[key] = clean;
+          updatedAny = true;
+        }
+      }
+    }
+  } else if (result.functionName === 'extract_office_lead' && result.extracted) {
+    for (const key of OFFICE_FIELDS) {
+      if (result.extracted[key] !== undefined && result.extracted[key] !== null) {
+        const clean = sanitizeOfficeField(key, result.extracted[key]);
+        if (clean !== null) {
+          session.office[key] = clean;
           updatedAny = true;
         }
       }
     }
   }
 
-  const missing = REQUIRED_FIELDS.filter((k) => !session.data[k]);
+  const ctvMissing = CTV_FIELDS.filter((k) => !session.ctv[k]);
+  const officeMissing = OFFICE_FIELDS.filter((k) => !session.office[k]);
+  const ctvHasProgress = CTV_FIELDS.some((k) => session.ctv[k]);
+  const officeHasProgress = OFFICE_FIELDS.some((k) => session.office[k]);
 
-  if (missing.length > 0) {
-    session.step = 'collecting';
-    if (result.text) {
-      await sendText(psid, result.text);
-    } else if (updatedAny) {
-      await sendText(psid, `Cảm ơn bạn! Mình còn cần thêm: ${missing.map((k) => FIELD_LABELS[k]).join(', ')}.`);
-    } else {
-      await sendText(
-        psid,
-        'Bạn có thể gửi lại giúp mình: họ tên, năm sinh, giới tính, chiều cao, cân nặng và số điện thoại nhé.'
-      );
-    }
+  if (ctvHasProgress && ctvMissing.length === 0) {
+    session.step = 'confirm';
+    session.pendingType = 'ctv';
+    if (result.text) await sendText(psid, result.text);
+    await sendCtvConfirm(psid, session.ctv);
     return;
   }
 
+  if (officeHasProgress && officeMissing.length === 0) {
+    session.step = 'confirm';
+    session.pendingType = 'office';
+    if (result.text) await sendText(psid, result.text);
+    await sendOfficeConfirm(psid, session.office);
+    return;
+  }
+
+  session.step = 'collecting';
   if (result.text) {
     await sendText(psid, result.text);
+  } else if (ctvHasProgress) {
+    await sendText(psid, `Cảm ơn bạn! Mình còn cần thêm: ${ctvMissing.map((k) => CTV_LABELS[k]).join(', ')}.`);
+  } else if (officeHasProgress) {
+    await sendText(psid, `Cảm ơn bạn! Mình còn cần thêm: ${officeMissing.map((k) => OFFICE_LABELS[k]).join(', ')}.`);
+  } else if (!updatedAny) {
+    await sendText(
+      psid,
+      'Bạn có thể cho mình biết bạn quan tâm vị trí nào, hoặc gửi luôn thông tin liên hệ để mình hỗ trợ nhé.'
+    );
   }
-  session.step = 'confirm';
-  await sendConfirm(psid, session.data);
 }
 
 async function greet(psid) {
   const session = getSession(psid);
-  const text = `Chào bạn 👋 Cảm ơn bạn đã quan tâm đăng ký làm Cộng tác viên bảo an tại ${COMPANY_NAME}. Bạn cứ hỏi mình thoải mái, hoặc giới thiệu luôn thông tin (họ tên, năm sinh, giới tính, chiều cao, cân nặng, số điện thoại) để đăng ký nhé!`;
+  const text = `Chào bạn 👋 Cảm ơn bạn đã quan tâm tuyển dụng tại ${COMPANY_NAME}. Bạn cứ hỏi mình về vị trí CTV bảo an sự kiện hay các vị trí văn phòng đều được, hoặc để lại thông tin để mình hỗ trợ đăng ký nhé!`;
   pushHistory(session, 'model', text);
   await sendText(psid, text);
 }
 
-async function sendConfirm(psid, data) {
+async function sendCtvConfirm(psid, data) {
   const summary =
     `Bạn kiểm tra lại thông tin giúp mình nhé:\n\n` +
     `👤 Họ tên: ${data.hoTen}\n` +
@@ -232,9 +277,34 @@ async function sendConfirm(psid, data) {
   ]);
 }
 
-async function submitCandidate(psid) {
+async function sendOfficeConfirm(psid, data) {
+  const summary =
+    `Bạn kiểm tra lại thông tin giúp mình nhé:\n\n` +
+    `👤 Họ tên: ${data.hoTen}\n` +
+    `📞 SĐT: ${data.sdt}\n` +
+    `💼 Vị trí quan tâm: ${data.viTriQuanTam}`;
+
+  await sendText(psid, summary);
+  await sendQuickReplies(psid, 'Thông tin đã chính xác chưa ạ? (Sai chỗ nào cứ nhắn lại để sửa)', [
+    { title: '✅ Xác nhận', payload: 'XAC_NHAN' },
+    { title: '✏️ Làm lại từ đầu', payload: 'NHAP_LAI' },
+  ]);
+}
+
+async function submitPending(psid) {
   const session = getSession(psid);
-  const { data } = session;
+
+  if (session.pendingType === 'ctv') {
+    await submitCandidate(psid, session);
+  } else if (session.pendingType === 'office') {
+    await submitOfficeLead(psid, session);
+  } else {
+    await sendText(psid, 'Có vẻ chưa có thông tin để xác nhận, bạn gõ "đăng ký" để bắt đầu lại giúp mình nhé.');
+  }
+}
+
+async function submitCandidate(psid, session) {
+  const data = session.ctv;
 
   if (!data.hoTen || !data.sdt) {
     await sendText(psid, 'Có vẻ thông tin chưa đầy đủ, bạn gõ "đăng ký" để bắt đầu lại giúp mình nhé.');
@@ -269,6 +339,30 @@ async function submitCandidate(psid) {
   }
 }
 
+async function submitOfficeLead(psid, session) {
+  const data = session.office;
+
+  if (!data.hoTen || !data.sdt || !data.viTriQuanTam) {
+    await sendText(psid, 'Có vẻ thông tin chưa đầy đủ, bạn gõ "đăng ký" để bắt đầu lại giúp mình nhé.');
+    return;
+  }
+
+  try {
+    await larkBase.addOfficeLead(data);
+    session.step = 'done';
+    await sendText(
+      psid,
+      `Cảm ơn bạn đã quan tâm vị trí ${data.viTriQuanTam}! Bộ phận nhân sự sẽ liên hệ bạn sớm nhất qua số điện thoại đã cung cấp. Bạn có thể gửi thêm CV qua email hr@ttsecurity.vn để được xem xét kỹ hơn nhé.`
+    );
+  } catch (err) {
+    console.error('Lark write failed:', err.response ? err.response.data : err.message);
+    await sendText(
+      psid,
+      'Xin lỗi, hệ thống đang gặp sự cố khi lưu thông tin. Bạn vui lòng thử bấm "Xác nhận" lại sau ít phút, hoặc liên hệ trực tiếp fanpage giúp mình nhé.'
+    );
+  }
+}
+
 // ---------- Facebook Send API helpers ----------
 
 async function sendText(psid, text) {
@@ -294,7 +388,7 @@ async function callSendAPI(psid, message) {
   );
 }
 
-app.get('/', (req, res) => res.send('FB chatbot tuyển dụng CTV bảo vệ đang chạy.'));
+app.get('/', (req, res) => res.send('FB chatbot tuyển dụng T&T đang chạy.'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server listening on port ${PORT}`));
