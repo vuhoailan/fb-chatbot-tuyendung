@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const larkBase = require('./larkBase');
+const geminiExtract = require('./geminiExtract');
 
 const app = express();
 app.use(express.json());
@@ -11,12 +12,20 @@ const PAGE_ACCESS_TOKEN = process.env.FB_PAGE_ACCESS_TOKEN;
 const COMPANY_NAME = process.env.COMPANY_NAME || 'công ty';
 const MIN_AGE = 18;
 
-// In-memory session store — reset if the server restarts (fine for MVP on free hosting).
-// Map<psid, { step: string, data: object }>
+const REQUIRED_FIELDS = ['hoTen', 'namSinh', 'gioiTinh', 'chieuCao', 'canNang', 'sdt'];
+const FIELD_LABELS = {
+  hoTen: 'Họ và tên',
+  namSinh: 'Năm sinh',
+  gioiTinh: 'Giới tính (Nam/Nữ)',
+  chieuCao: 'Chiều cao (cm)',
+  canNang: 'Cân nặng (kg)',
+  sdt: 'Số điện thoại',
+};
+
 const sessions = new Map();
 
 function newSession() {
-  return { step: 'hoTen', data: {} };
+  return { step: 'collecting', data: {} };
 }
 
 function getSession(psid) {
@@ -24,7 +33,33 @@ function getSession(psid) {
   return sessions.get(psid);
 }
 
-// ---------- Facebook webhook ----------
+function sanitizeField(key, value) {
+  switch (key) {
+    case 'hoTen':
+      return typeof value === 'string' && value.trim().length >= 2 ? value.trim() : null;
+    case 'namSinh': {
+      const year = parseInt(value, 10);
+      const currentYear = new Date().getFullYear();
+      return year && year > currentYear - 80 && year < currentYear - 14 ? year : null;
+    }
+    case 'gioiTinh':
+      return value === 'Nam' || value === 'Nữ' ? value : null;
+    case 'chieuCao': {
+      const cm = parseInt(value, 10);
+      return cm && cm >= 100 && cm <= 230 ? cm : null;
+    }
+    case 'canNang': {
+      const kg = parseInt(value, 10);
+      return kg && kg >= 30 && kg <= 200 ? kg : null;
+    }
+    case 'sdt': {
+      const digits = String(value).replace(/[^0-9]/g, '');
+      return digits.length >= 9 && digits.length <= 11 ? digits : null;
+    }
+    default:
+      return null;
+  }
+}
 
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
@@ -46,7 +81,6 @@ app.post('/webhook', async (req, res) => {
     return res.sendStatus(404);
   }
 
-  // Ack immediately; Facebook requires a fast 200.
   res.status(200).send('EVENT_RECEIVED');
 
   for (const entry of body.entry || []) {
@@ -74,28 +108,20 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ---------- Conversation logic ----------
-
 async function handlePayload(psid, payload) {
   switch (payload) {
     case 'GET_STARTED':
     case 'DANG_KY':
       sessions.set(psid, newSession());
       await sendText(psid, chaoMung());
-      await askHoTen(psid);
-      break;
-    case 'GIOI_TINH_NAM':
-      await setGioiTinh(psid, 'Nam');
-      break;
-    case 'GIOI_TINH_NU':
-      await setGioiTinh(psid, 'Nữ');
+      await askInfo(psid);
       break;
     case 'XAC_NHAN':
       await submitCandidate(psid);
       break;
     case 'NHAP_LAI':
       sessions.set(psid, newSession());
-      await askHoTen(psid);
+      await askInfo(psid);
       break;
   }
 }
@@ -106,121 +132,65 @@ async function handleText(psid, text) {
   if (['dang ky', 'đăng ký', 'bắt đầu', 'bat dau', 'start'].includes(lower)) {
     sessions.set(psid, newSession());
     await sendText(psid, chaoMung());
-    await askHoTen(psid);
+    await askInfo(psid);
     return;
   }
 
   const session = getSession(psid);
 
-  switch (session.step) {
-    case 'hoTen':
-      if (text.length < 2) {
-        await sendText(psid, 'Bạn vui lòng nhập họ và tên đầy đủ giúp mình nhé.');
-        return;
-      }
-      session.data.hoTen = text;
-      session.step = 'namSinh';
-      await sendText(psid, '2️⃣ Năm sinh của bạn là năm nào? (VD: 2000)');
-      break;
-
-    case 'namSinh': {
-      const year = parseInt(text, 10);
-      const currentYear = new Date().getFullYear();
-      if (!year || year < currentYear - 80 || year > currentYear - 14) {
-        await sendText(psid, 'Bạn nhập giúp mình năm sinh dạng số có 4 chữ số nhé (VD: 2000).');
-        return;
-      }
-      session.data.namSinh = year;
-      session.step = 'gioiTinh';
-      await sendQuickReplies(psid, '3️⃣ Giới tính của bạn?', [
-        { title: 'Nam', payload: 'GIOI_TINH_NAM' },
-        { title: 'Nữ', payload: 'GIOI_TINH_NU' },
-      ]);
-      break;
-    }
-
-    case 'gioiTinh':
-      if (['nam'].includes(lower)) {
-        await setGioiTinh(psid, 'Nam');
-      } else if (['nữ', 'nu'].includes(lower)) {
-        await setGioiTinh(psid, 'Nữ');
-      } else {
-        await sendText(psid, 'Bạn vui lòng bấm 1 trong 2 nút Nam / Nữ phía trên giúp mình nhé.');
-      }
-      break;
-
-    case 'chieuCao': {
-      const cm = parseInt(text, 10);
-      if (!cm || cm < 100 || cm > 230) {
-        await sendText(psid, 'Bạn nhập chiều cao theo cm giúp mình nhé (VD: 170).');
-        return;
-      }
-      session.data.chieuCao = cm;
-      session.step = 'canNang';
-      await sendText(psid, '5️⃣ Cân nặng của bạn (kg)?');
-      break;
-    }
-
-    case 'canNang': {
-      const kg = parseInt(text, 10);
-      if (!kg || kg < 30 || kg > 200) {
-        await sendText(psid, 'Bạn nhập cân nặng theo kg giúp mình nhé (VD: 60).');
-        return;
-      }
-      session.data.canNang = kg;
-      session.step = 'sdt';
-      await sendText(psid, '6️⃣ Số điện thoại liên hệ của bạn?');
-      break;
-    }
-
-    case 'sdt': {
-      const digits = text.replace(/[^0-9]/g, '');
-      if (digits.length < 9 || digits.length > 11) {
-        await sendText(psid, 'Số điện thoại chưa đúng định dạng, bạn nhập lại giúp mình nhé (VD: 0912345678).');
-        return;
-      }
-      session.data.sdt = digits;
-      session.step = 'confirm';
-      await sendConfirm(psid, session.data);
-      break;
-    }
-
-    case 'confirm':
-      if (['xac nhan', 'xác nhận'].includes(lower)) {
-        await submitCandidate(psid);
-      } else if (['nhap lai', 'nhập lại'].includes(lower)) {
-        sessions.set(psid, newSession());
-        await askHoTen(psid);
-      } else {
-        await sendText(psid, 'Bạn vui lòng bấm "Xác nhận" hoặc "Nhập lại" phía trên giúp mình nhé.');
-      }
-      break;
-
-    case 'done':
-      await sendText(psid, 'Thông tin của bạn đã được ghi nhận rồi nhé! Nếu muốn đăng ký thêm một hồ sơ khác, bạn gõ "đăng ký".');
-      break;
-
-    default:
-      sessions.set(psid, newSession());
-      await sendText(psid, chaoMung());
-      await askHoTen(psid);
+  if (session.step === 'done') {
+    await sendText(psid, 'Thông tin của bạn đã được ghi nhận rồi nhé! Nếu muốn đăng ký thêm một hồ sơ khác, bạn gõ "đăng ký".');
+    return;
   }
-}
 
-async function setGioiTinh(psid, gioiTinh) {
-  const session = getSession(psid);
-  if (session.step !== 'gioiTinh') return;
-  session.data.gioiTinh = gioiTinh;
-  session.step = 'chieuCao';
-  await sendText(psid, '4️⃣ Chiều cao của bạn (cm)?');
+  let extracted;
+  try {
+    extracted = await geminiExtract.extractCandidateInfo(text);
+  } catch (err) {
+    console.error('Gemini extract failed:', err.response ? err.response.data : err.message);
+    await sendText(psid, 'Mình đang gặp chút trục trặc khi đọc thông tin, bạn thử gửi lại giúp mình nhé.');
+    return;
+  }
+
+  let updatedAny = false;
+  for (const key of REQUIRED_FIELDS) {
+    if (extracted[key] !== undefined && extracted[key] !== null) {
+      const clean = sanitizeField(key, extracted[key]);
+      if (clean !== null) {
+        session.data[key] = clean;
+        updatedAny = true;
+      }
+    }
+  }
+
+  const missing = REQUIRED_FIELDS.filter((k) => !session.data[k]);
+
+  if (missing.length > 0) {
+    session.step = 'collecting';
+    if (!updatedAny) {
+      await sendText(
+        psid,
+        'Mình chưa nhận ra thông tin đăng ký nào trong tin nhắn đó. Bạn thử gửi lại giúp mình: họ tên, năm sinh, giới tính, chiều cao, cân nặng và số điện thoại nhé.'
+      );
+      return;
+    }
+    await sendText(psid, `Cảm ơn bạn! Mình còn cần thêm: ${missing.map((k) => FIELD_LABELS[k]).join(', ')}.`);
+    return;
+  }
+
+  session.step = 'confirm';
+  await sendConfirm(psid, session.data);
 }
 
 function chaoMung() {
   return `Chào bạn 👋 Cảm ơn bạn đã quan tâm đăng ký làm Cộng tác viên bảo vệ tại ${COMPANY_NAME}. Mình sẽ hỏi bạn vài thông tin cơ bản nhé!`;
 }
 
-async function askHoTen(psid) {
-  await sendText(psid, '1️⃣ Cho mình xin họ và tên đầy đủ của bạn:');
+async function askInfo(psid) {
+  await sendText(
+    psid,
+    'Bạn giới thiệu giúp mình một số thông tin nhé: họ tên, năm sinh, giới tính, chiều cao (cm), cân nặng (kg) và số điện thoại. Cứ gõ tự nhiên thoải mái, mình sẽ tự hiểu 🙂'
+  );
 }
 
 async function sendConfirm(psid, data) {
@@ -234,9 +204,9 @@ async function sendConfirm(psid, data) {
     `📞 SĐT: ${data.sdt}`;
 
   await sendText(psid, summary);
-  await sendQuickReplies(psid, 'Thông tin đã chính xác chưa ạ?', [
+  await sendQuickReplies(psid, 'Thông tin đã chính xác chưa ạ? (Sai chỗ nào cứ nhắn lại để sửa)', [
     { title: '✅ Xác nhận', payload: 'XAC_NHAN' },
-    { title: '✏️ Nhập lại', payload: 'NHAP_LAI' },
+    { title: '✏️ Làm lại từ đầu', payload: 'NHAP_LAI' },
   ]);
 }
 
@@ -277,8 +247,6 @@ async function submitCandidate(psid) {
   }
 }
 
-// ---------- Facebook Send API helpers ----------
-
 async function sendText(psid, text) {
   await callSendAPI(psid, { text });
 }
@@ -306,4 +274,3 @@ app.get('/', (req, res) => res.send('FB chatbot tuyển dụng CTV bảo vệ đ
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`Server listening on port ${PORT}`));
-
