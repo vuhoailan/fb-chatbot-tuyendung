@@ -5,6 +5,8 @@ const APP_ID = process.env.LARK_APP_ID;
 const APP_SECRET = process.env.LARK_APP_SECRET;
 const BASE_APP_TOKEN = process.env.LARK_BASE_APP_TOKEN;
 const TABLE_ID = process.env.LARK_TABLE_ID;
+const OFFICE_BASE_APP_TOKEN = process.env.LARK_OFFICE_BASE_APP_TOKEN;
+const OFFICE_TABLE_ID = process.env.LARK_OFFICE_TABLE_ID;
 
 let cachedToken = null;
 let tokenExpiryMs = 0;
@@ -59,6 +61,31 @@ async function addCandidate(candidate) {
   return resp.data.data.record;
 }
 
+// Office/leadership role leads (HCNS, Sale MKT, Kế toán, Nghiệp vụ...) go to a
+// separate Base from the event-security CTV roster — different table shape, and
+// keeps this general recruiting data out of the Tràng Tiền Plaza-specific Base.
+async function addOfficeLead(lead) {
+  const token = await getTenantAccessToken();
+  const fields = {
+    'Họ tên': lead.hoTen,
+    'SĐT': lead.sdt,
+    'Vị trí quan tâm': lead.viTriQuanTam,
+    'Ghi chú': lead.ghiChu || 'Đăng ký qua Fanpage Messenger',
+  };
+
+  const resp = await axios.post(
+    `${LARK_DOMAIN}/open-apis/bitable/v1/apps/${OFFICE_BASE_APP_TOKEN}/tables/${OFFICE_TABLE_ID}/records`,
+    { fields },
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+
+  if (resp.data.code !== 0) {
+    throw new Error(`Lark create office lead failed: ${resp.data.code} ${resp.data.msg}`);
+  }
+
+  return resp.data.data.record;
+}
+
 // Utility to inspect the real field schema of the target table.
 // Run once (e.g. via `node -e "require('./larkBase').listFields().then(console.log)"`)
 // after setting env vars, then fix buildFields() above to match exactly.
@@ -71,4 +98,4 @@ async function listFields() {
   return resp.data.data.items.map((f) => ({ name: f.field_name, type: f.type }));
 }
 
-module.exports = { addCandidate, listFields, getTenantAccessToken };
+module.exports = { addCandidate, addOfficeLead, listFields, getTenantAccessToken };
